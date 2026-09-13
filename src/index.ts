@@ -2539,6 +2539,7 @@ async function main(): Promise<void> {
         });
       },
       onUserPromptSubmit: (frame) => {
+        turnCostAttributor.recordSlashCommand(frame.sessionId, frame.slashCommand ?? null);
         taskDetector!.startTaskIfNone(frame.timestamp);
       },
       onStop: (frame) => {

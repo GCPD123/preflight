@@ -1,3 +1,5 @@
+import type { ToolCallRecord } from '../storage/types.js';
+
 /**
  * Splits a flat, timestamp-ordered sequence into one group per agent — the
  * parent/orchestrator session (`agentId` absent) plus one per distinct
@@ -31,4 +33,26 @@ export function partitionByAgent<T extends { readonly agentId?: string }>(
   }
 
   return [...groups.values()];
+}
+
+/**
+ * Fills in `ToolCallRecord.agentId` from a `toolUseId → agentId` map when the
+ * record's own `agentId` is absent — Claude Code's hook envelope documents
+ * `agent_id`/`agent_type` as present on every hook event fired inside a
+ * subagent call, but in practice it never populates. `toolUseId`
+ * is reliable on both sides: it's already captured correctly on every
+ * ToolCallRecord, and it's the same id Claude Code assigns to the matching
+ * `tool_use` block in that subagent's own transcript, which `SubagentWatcher`
+ * already tails for token accounting. Returns the same object reference when
+ * no backfill applies, so callers can cheaply check whether anything changed.
+ */
+export function backfillAgentId(
+  record: ToolCallRecord,
+  toolUseIdToAgentId: ReadonlyMap<string, string>,
+): ToolCallRecord {
+  if (record.agentId !== undefined) return record;
+  if (typeof record.toolUseId !== 'string') return record;
+  const agentId = toolUseIdToAgentId.get(record.toolUseId);
+  if (agentId === undefined) return record;
+  return { ...record, agentId };
 }

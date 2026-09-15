@@ -549,7 +549,7 @@ export class ParentTranscriptWatcher {
     if (!fields) return null;
     // Subagent turns are inlined into the main transcript too — skip them so
     // they're never double-attributed as parent-session cost. Mirrors
-    // TranscriptMessageTracker.isRealAssistantEntry()'s identical check.
+    // TranscriptMessageTracker's identical check via the shared isRealAssistantTurn() predicate.
     if (fields.isSidechain) return null;
 
     const model = fields.model;

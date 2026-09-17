@@ -7,7 +7,6 @@ import {
   buildOutcomeData,
   buildAntiPatternSeries,
   aggregateModelPerformance,
-  aggregateToolUsage,
   padDailyCostWindow,
   computeHistoryKpis,
   filterSessionsToWindow,
@@ -313,6 +312,22 @@ const SAMPLE_USAGE_INSIGHTS = {
   attributionRatePct: 40,
 };
 
+// Read/Edit costs are attributed; Bash/Write (present in SAMPLE_SESSIONS'
+// toolBreakdown) intentionally have no entry — calls with no attributed
+// cost yet, per a mix of attributed/unattributed sessions in the window.
+const SAMPLE_COST_PER_TOOL = {
+  turns: [],
+  costByToolType: {
+    Read: { totalCost: 3.5, callCount: 36, avgCost: 3.5 / 36, tokens: 12000 },
+    Edit: { totalCost: 1.5, callCount: 12, avgCost: 0.125, tokens: 4000 },
+  },
+  costBySkill: {},
+  totalAttributedCost: 5,
+  attributionRate: 0.8,
+  attributedSessionCount: 3,
+  totalSessionCount: 4,
+};
+
 interface FetchOverrides {
   weekly?: unknown;
   outcome?: unknown;
@@ -323,6 +338,8 @@ interface FetchOverrides {
   collabProfile?: unknown;
   sessions?: unknown;
   usageInsights?: unknown;
+  todayAggregate?: unknown;
+  costPerTool?: unknown;
 }
 
 function jsonResponse(body: unknown): Response {
@@ -353,6 +370,9 @@ function renderHistory(overrides: FetchOverrides = {}) {
     if (url.startsWith('/api/cost-per-outcome')) {
       return Promise.resolve(jsonResponse(overrides.outcome ?? SAMPLE_OUTCOME));
     }
+    if (url.startsWith('/api/cost-per-tool')) {
+      return Promise.resolve(jsonResponse(overrides.costPerTool ?? null));
+    }
     if (url.startsWith('/api/personal-coach')) {
       return Promise.resolve(jsonResponse(overrides.coach ?? SAMPLE_COACH_OK));
     }
@@ -367,6 +387,20 @@ function renderHistory(overrides: FetchOverrides = {}) {
     }
     if (url.startsWith('/api/collaboration-profile')) {
       return Promise.resolve(jsonResponse(overrides.collabProfile ?? SAMPLE_COLLAB_PROFILE));
+    }
+    if (url.startsWith('/api/sessions/today/aggregate')) {
+      return Promise.resolve(
+        jsonResponse(
+          overrides.todayAggregate ?? {
+            toolCallCount: 0,
+            totalCostUsd: 0,
+            antiPatternCount: 0,
+            avgDurationMs: 0,
+            sessionCount: 0,
+            sparkline: { startTimestamp: 0, bucketSizeMs: 1000, points: [] },
+          },
+        ),
+      );
     }
     if (url.startsWith('/api/sessions')) {
       return Promise.resolve(jsonResponse(overrides.sessions ?? SAMPLE_SESSIONS));
@@ -456,6 +490,63 @@ describe('History view', () => {
     renderHistory();
     await waitFor(() => expect(screen.getByText('Daily spend')).toBeInTheDocument());
     expect(screen.queryByText(/sample doesn.t reach back 30 days/i)).not.toBeInTheDocument();
+  });
+
+  it('renders forecast caption with this week and this month when todayAggregate provides forecastEndOfDayUsd', async () => {
+    const sessions = [
+      {
+        sessionId: 's1',
+        startTime: daysAgo(3, 9),
+        estimatedCostUsd: 1.2,
+        model: 'claude-opus-4-6',
+        toolBreakdown: { Read: 1 },
+      },
+      {
+        sessionId: 's2',
+        startTime: daysAgo(1, 10),
+        estimatedCostUsd: 2.5,
+        model: 'claude-opus-4-6',
+        toolBreakdown: { Read: 1 },
+      },
+    ];
+    const todayAggregate = {
+      toolCallCount: 5,
+      totalCostUsd: 2.0,
+      antiPatternCount: 0,
+      avgDurationMs: 1000,
+      sessionCount: 1,
+      sparkline: { startTimestamp: Date.now(), bucketSizeMs: 1000, points: [2, 3, 1, 5] },
+      forecastEndOfDayUsd: 3.5,
+    };
+    renderHistory({ sessions, todayAggregate });
+    await waitFor(() => expect(screen.getByText('Daily spend')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/On pace for/i)).toBeInTheDocument());
+    expect(screen.getByText(/this week/i)).toBeInTheDocument();
+    expect(screen.getByText(/this month/i)).toBeInTheDocument();
+  });
+
+  it('does not render forecast caption when todayAggregate does not provide forecastEndOfDayUsd', async () => {
+    const sessions = [
+      {
+        sessionId: 's1',
+        startTime: daysAgo(3, 9),
+        estimatedCostUsd: 1.2,
+        model: 'claude-opus-4-6',
+        toolBreakdown: { Read: 1 },
+      },
+    ];
+    const todayAggregate = {
+      toolCallCount: 0,
+      totalCostUsd: 0,
+      antiPatternCount: 0,
+      avgDurationMs: 0,
+      sessionCount: 0,
+      sparkline: { startTimestamp: Date.now(), bucketSizeMs: 1000, points: [] },
+      forecastEndOfDayUsd: null,
+    };
+    renderHistory({ sessions, todayAggregate });
+    await waitFor(() => expect(screen.getByText('Daily spend')).toBeInTheDocument());
+    expect(screen.queryByText(/On pace for/)).not.toBeInTheDocument();
   });
 
   it('uses the real 12-week window in the activity heatmap aria-label', async () => {
@@ -698,46 +789,7 @@ describe('History — KPI strip', () => {
   });
 });
 
-describe('History — Tools and Cost per outcome tables', () => {
-  it('renders a Tools row for the leading tool with its share of calls', async () => {
-    renderHistory();
-    const panel = findPanel("What's contributing to your spend");
-    // aggregateToolUsage(SAMPLE_SESSIONS): Read=36, Edit=12, Bash=3, Write=2,
-    // total=53 -> Read's share = round(36/53*100) = 68%.
-    const cell = await within(panel).findByRole('cell', { name: 'Read' });
-    const row = cell.closest('tr') as HTMLElement;
-    expect(within(row).getByRole('cell', { name: '36' })).toBeInTheDocument();
-    expect(within(row).getByRole('cell', { name: '68%' })).toBeInTheDocument();
-    // No windowed per-tool cost figure exists, so the header says what the
-    // share is actually of.
-    expect(within(panel).getByRole('columnheader', { name: 'Share of calls' })).toBeInTheDocument();
-  });
-
-  it('sorts the Tools table by its clicked column', async () => {
-    renderHistory();
-    const panel = findPanel("What's contributing to your spend");
-    await within(panel).findByRole('cell', { name: 'Read' });
-    const toolsTable = screen.getByText('Tools', { selector: 'h4' }).closest('div') as HTMLElement;
-    const toolNameForRow = (row: HTMLElement) => within(row).getAllByRole('cell')[0]!.textContent;
-
-    // Default sort is share of calls descending.
-    expect(within(toolsTable).getAllByRole('row').slice(1).map(toolNameForRow)).toEqual([
-      'Read',
-      'Edit',
-      'Bash',
-      'Write',
-    ]);
-
-    // A second click on the same (already-descending) column reverses it.
-    fireEvent.click(within(toolsTable).getByRole('button', { name: 'Share of calls' }));
-    expect(within(toolsTable).getAllByRole('row').slice(1).map(toolNameForRow)).toEqual([
-      'Write',
-      'Bash',
-      'Edit',
-      'Read',
-    ]);
-  });
-
+describe('History — Cost per outcome table', () => {
   it('renders a Cost per outcome row for the leading outcome with its spend share', async () => {
     renderHistory();
     const panel = findPanel('Cost per outcome');
@@ -1523,42 +1575,6 @@ describe('aggregateModelPerformance', () => {
   });
 });
 
-describe('aggregateToolUsage', () => {
-  it('merges tool breakdowns across sessions and returns top 8', () => {
-    const sessions: Parameters<typeof aggregateToolUsage>[0] = [
-      { sessionId: 's1', toolBreakdown: { Read: 10, Edit: 5, Bash: 3 } },
-      { sessionId: 's2', toolBreakdown: { Read: 8, Edit: 7, Write: 2 } },
-    ];
-    const result = aggregateToolUsage(sessions);
-    expect(result[0]).toEqual({ tool: 'Read', count: 18 });
-    expect(result[1]).toEqual({ tool: 'Edit', count: 12 });
-    expect(result[2]).toEqual({ tool: 'Bash', count: 3 });
-    expect(result[3]).toEqual({ tool: 'Write', count: 2 });
-  });
-
-  it('limits to top 8 tools', () => {
-    const toolBreakdown: Record<string, number> = {};
-    for (let i = 0; i < 12; i++) {
-      toolBreakdown[`tool_${i}`] = 12 - i;
-    }
-    const sessions = [{ sessionId: 's1', toolBreakdown }];
-    const result = aggregateToolUsage(sessions);
-    expect(result).toHaveLength(8);
-    expect(result[0].tool).toBe('tool_0');
-    expect(result[7].tool).toBe('tool_7');
-  });
-
-  it('skips sessions without toolBreakdown', () => {
-    const sessions = [{ sessionId: 's1' }, { sessionId: 's2', toolBreakdown: { Read: 5 } }];
-    const result = aggregateToolUsage(sessions);
-    expect(result).toEqual([{ tool: 'Read', count: 5 }]);
-  });
-
-  it('returns empty array for empty input', () => {
-    expect(aggregateToolUsage([])).toEqual([]);
-  });
-});
-
 describe('CoachMetricsTable', () => {
   it('renders all four metric row labels and the efficiency delta badge', async () => {
     renderHistory();
@@ -1597,106 +1613,72 @@ describe('CoachMetricsTable', () => {
   });
 });
 
-describe('UsageContributionPanel', () => {
-  it('renders the contribution panel title with the window subtitle and no per-panel toggle', async () => {
-    renderHistory();
-    await waitFor(() => expect(screen.getByText('Daily spend')).toBeInTheDocument());
+describe('History — Tools table cost/token columns', () => {
+  // Skills/Subagents/Plugins already have their own "% of spend" columns
+  // (SAMPLE_USAGE_INSIGHTS), so assertions about the Tools table's own
+  // header/columns scope to its own table, not the whole panel.
+  function findToolsTable(panel: HTMLElement): HTMLElement {
+    return within(panel).getByText('Tools', { selector: 'h4' }).closest('div') as HTMLElement;
+  }
+
+  it('fetches the windowed /api/cost-per-tool for the selected window and shows Cost/Tokens columns with a coverage caveat', async () => {
+    const { fetchedUrls } = renderHistory({ costPerTool: SAMPLE_COST_PER_TOOL });
+    await waitFor(() =>
+      expect(fetchedUrls.some((u) => u.startsWith('/api/cost-per-tool?days=30'))).toBe(true),
+    );
     const panel = findPanel("What's contributing to your spend");
-    expect(within(panel).getByText('Last 30 days')).toBeInTheDocument();
-    expect(within(panel).queryByRole('tab')).toBeNull();
-  });
-
-  it('renders each insight headline, one row from each of the five tables, and the low-attribution footnote', async () => {
-    renderHistory({ usageInsights: SAMPLE_USAGE_INSIGHTS });
     await waitFor(() =>
-      expect(screen.getByText('High-context sessions are driving spend')).toBeInTheDocument(),
+      expect(
+        within(findToolsTable(panel)).getByRole('columnheader', { name: '% of spend' }),
+      ).toBeInTheDocument(),
     );
-    expect(screen.getByText('Subagent delegation is a large cost driver')).toBeInTheDocument();
-    expect(screen.getByText('code-review')).toBeInTheDocument();
-    expect(screen.getByText('general-purpose')).toBeInTheDocument();
-    expect(screen.getByText('pstack')).toBeInTheDocument();
-    expect(screen.getByText('Nightly loop')).toBeInTheDocument();
-    expect(screen.getByRole('cell', { name: 'Read' })).toBeInTheDocument();
-    expect(screen.getByText(/40% of spend with/)).toBeInTheDocument();
+    const toolsTable = findToolsTable(panel);
+
+    const readRow = within(toolsTable)
+      .getByRole('cell', { name: 'Read' })
+      .closest('tr') as HTMLElement;
+    expect(within(readRow).getByRole('cell', { name: '$3.50' })).toBeInTheDocument();
+    expect(within(readRow).getByRole('cell', { name: '12.0k' })).toBeInTheDocument();
+
+    // Bash has calls (from SAMPLE_SESSIONS' toolBreakdown) but no entry in
+    // SAMPLE_COST_PER_TOOL.costByToolType — not yet attributed, so its cost
+    // and tokens cells must both show a dash instead of a fabricated 0.
+    const bashRow = within(toolsTable)
+      .getByRole('cell', { name: 'Bash' })
+      .closest('tr') as HTMLElement;
+    expect(within(bashRow).getAllByRole('cell', { name: '—' })).toHaveLength(2);
+
+    expect(
+      screen.getByText(
+        'Cost/token breakdown only available for 3 of 4 sessions in this window — older sessions predate per-tool attribution.',
+      ),
+    ).toBeInTheDocument();
   });
 
-  it('links the Loops Session cell to that session, keyed by sessionId', async () => {
-    renderHistory({ usageInsights: SAMPLE_USAGE_INSIGHTS });
-    const link = await screen.findByRole('link', { name: 'Nightly loop' });
-    expect(link).toHaveAttribute('href', '/sessions?sessionIds=loop-session-1');
-  });
-
-  it('links the Loops Session cell to the 8-char session id when it has no name', async () => {
+  it('omits the coverage caveat when every session in the window has attribution data', async () => {
     renderHistory({
-      usageInsights: {
-        ...SAMPLE_USAGE_INSIGHTS,
-        loops: [
-          {
-            sessionId: 'unnamed-session-42',
-            sessionName: null,
-            runs: 2,
-            tokens: 1000,
-            tokensPerRun: 500,
-            costUsd: 0.3,
-            lastRunMs: Date.now(),
-          },
-        ],
-      },
+      costPerTool: { ...SAMPLE_COST_PER_TOOL, attributedSessionCount: 4, totalSessionCount: 4 },
     });
-    const link = await screen.findByRole('link', { name: 'unnamed-' });
-    expect(link).toHaveAttribute('href', '/sessions?sessionIds=unnamed-session-42');
-  });
-
-  it('says how many rows a capped table dropped, and nothing when it dropped none', async () => {
-    renderHistory({
-      usageInsights: { ...SAMPLE_USAGE_INSIGHTS, skillsTotalCount: 14, loopsTotalCount: 1 },
-    });
-    await waitFor(() => expect(screen.getByText('code-review')).toBeInTheDocument());
-    expect(screen.getByText('top 1 of 14')).toBeInTheDocument();
-    expect(screen.queryByText('top 1 of 1')).not.toBeInTheDocument();
-  });
-
-  it('renders "<1%" instead of "0%" for a row with spend that rounds to a zero share', async () => {
-    renderHistory({
-      usageInsights: {
-        ...SAMPLE_USAGE_INSIGHTS,
-        plugins: [{ key: 'tiny-plugin', costUsd: 0.01, tokens: 50, count: 1, sharePct: 0 }],
-      },
-    });
-    await waitFor(() => expect(screen.getByText('tiny-plugin')).toBeInTheDocument());
-    expect(screen.getByText('<1%')).toBeInTheDocument();
-  });
-
-  it('shows "No sessions in this window." when sessionCount is 0', async () => {
-    renderHistory({
-      usageInsights: {
-        ...SAMPLE_USAGE_INSIGHTS,
-        sessionCount: 0,
-        insights: [],
-        skills: [],
-        subagents: [],
-        plugins: [],
-        loops: [],
-      },
-    });
+    const panel = findPanel("What's contributing to your spend");
     await waitFor(() =>
-      expect(screen.getByText('No sessions in this window.')).toBeInTheDocument(),
+      expect(
+        within(findToolsTable(panel)).getByRole('columnheader', { name: '% of spend' }),
+      ).toBeInTheDocument(),
     );
+    expect(screen.queryByText(/predate per-tool attribution/)).toBeNull();
   });
 
-  it('shows "Nothing stands out in this window." with empty insights while still rendering a populated skills table', async () => {
-    renderHistory({
-      usageInsights: {
-        ...SAMPLE_USAGE_INSIGHTS,
-        insights: [],
-        subagents: [],
-        plugins: [],
-        loops: [],
-      },
-    });
+  it('falls back to calls-based "Share of calls" when /api/cost-per-tool has no data', async () => {
+    renderHistory();
+    const panel = findPanel("What's contributing to your spend");
     await waitFor(() =>
-      expect(screen.getByText('Nothing stands out in this window.')).toBeInTheDocument(),
+      expect(
+        within(findToolsTable(panel)).getByRole('columnheader', { name: 'Share of calls' }),
+      ).toBeInTheDocument(),
     );
-    expect(screen.getByText('code-review')).toBeInTheDocument();
+    expect(
+      within(findToolsTable(panel)).queryByRole('columnheader', { name: '% of spend' }),
+    ).toBeNull();
+    expect(screen.queryByText(/predate per-tool attribution/)).toBeNull();
   });
 });

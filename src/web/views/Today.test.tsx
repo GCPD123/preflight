@@ -1,14 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import {
-  Today,
-  aggregateAttentionFlags,
-  bucketByHour,
-  buildWeekForecast,
-  buildSpendTodaySeries,
-  type SessionSummary,
-} from './Today';
+import { Today, aggregateAttentionFlags, bucketByHour, buildSpendTodaySeries } from './Today';
 import { useLiveStore } from '../store/liveStore';
 import { qk } from '../api/client';
 import { localStartOfDay } from '../../lib/date.js';
@@ -60,7 +53,7 @@ describe('Today view', () => {
   it('renders the four KPI labels', () => {
     renderToday();
     expect(screen.getByText('spend today')).toBeInTheDocument();
-    expect(screen.getByText('tool calls')).toBeInTheDocument();
+    expect(screen.getByText('sessions today')).toBeInTheDocument();
     expect(screen.getByText('efficiency')).toBeInTheDocument();
     expect(screen.getByText('flags')).toBeInTheDocument();
   });
@@ -590,7 +583,7 @@ describe('Today view', () => {
     }) as typeof fetch;
 
     renderToday();
-    await waitFor(() => expect(screen.getByText('→ $8.00 by end of day')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^→ \$8\.00 by end of day/)).toBeInTheDocument());
   });
 
   function stubObservabilityHealth(body: Record<string, unknown>): void {
@@ -714,7 +707,7 @@ describe('Today view', () => {
 
     renderToday();
 
-    await waitFor(() => expect(screen.getByText('→ $12.00 by end of day')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^→ \$12\.00 by end of day/)).toBeInTheDocument());
   });
 });
 
@@ -744,7 +737,7 @@ describe('Today view — empty state', () => {
     renderToday();
     expect(await screen.findByText('No activity yet today')).toBeInTheDocument();
     expect(screen.queryByText('spend today')).toBeNull();
-    expect(screen.queryByText('tool calls')).toBeNull();
+    expect(screen.queryByText('sessions today')).toBeNull();
   });
 
   it('still renders the header with "Today" title in empty state', async () => {
@@ -842,7 +835,7 @@ describe('Today view — aggregate endpoint', () => {
     vi.restoreAllMocks();
   });
 
-  it('renders KPIs from /api/sessions/today/aggregate (calls + flags + spend)', async () => {
+  it('renders KPIs from /api/sessions/today/aggregate (sessions + flags + spend)', async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = String(input);
       if (url.includes('/api/sessions/today/aggregate')) {
@@ -865,7 +858,7 @@ describe('Today view — aggregate endpoint', () => {
     }) as typeof fetch;
 
     renderToday();
-    expect(await screen.findByText('42')).toBeInTheDocument();
+    expect(await screen.findByText('2')).toBeInTheDocument();
     expect(screen.getByText('$7.75')).toBeInTheDocument();
     expect(screen.getByText('3')).toBeInTheDocument();
   });
@@ -1113,6 +1106,64 @@ describe('Today view — selector default + Session ended badge', () => {
     await waitFor(() => {
       expect(screen.getByTestId('session-ended-badge')).toBeInTheDocument();
     });
+  });
+
+  // Regression test: when nothing is currently live, the pane must still
+  // default to the most recently active historical session instead of
+  // leaving activeId null and showing the trace pane's empty state.
+  it('defaults to the most recently active historical session when nothing is live', async () => {
+    const historicalSession = {
+      sessionId: 'yesterday-id',
+      sessionName: 'legacy-work',
+      startTime: localStartOfDay() + 60 * 60 * 1000,
+      durationMs: 5 * 60 * 1000,
+      toolCallCount: 3,
+      estimatedCostUsd: 0.1,
+    };
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/sessions/live')) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/session/current')) {
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/sessions?limit=')) {
+        return new Response(JSON.stringify([historicalSession]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/api/sessions/yesterday-id/replay')) {
+        return new Response(
+          JSON.stringify({
+            sessionId: 'yesterday-id',
+            timeline: [{ timestamp: 1, toolName: 'Read', durationMs: 10, success: true }],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    renderToday();
+
+    expect(await screen.findByText('legacy-work')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(useLiveStore.getState().activeSessionId).toBe('yesterday-id');
+    });
+    expect(screen.queryByText('Select a session to view its timeline.')).toBeNull();
+    expect(screen.queryByText('Waiting for tool calls')).toBeNull();
+    expect(screen.queryByText('No tool calls')).toBeNull();
   });
 });
 
@@ -1570,6 +1621,259 @@ describe('Today view — Needs attention panel', () => {
     const titles = screen.getAllByText(/(?:Old|Middle|New) alert/);
     expect(titles.map((el) => el.textContent)).toEqual(['New alert', 'Middle alert', 'Old alert']);
   });
+
+  // Regression test: persistedAntiPatterns (the panel's third-priority
+  // fallback, used when both the live SSE list and /api/anti-patterns are
+  // empty) must scope to today the same way every sibling KPI does via
+  // todayOverlapRatio. Without the filter, a days-old session with
+  // antiPatterns still surfaces here even though it has zero overlap with
+  // today.
+  it("excludes a days-old session's anti-patterns while still showing today's", async () => {
+    const todayStart = localStartOfDay();
+    const oldSession = {
+      sessionId: 'old-session',
+      startTime: todayStart - 5 * 24 * 60 * 60 * 1000,
+      durationMs: 30 * 60 * 1000,
+      toolCallCount: 20,
+      estimatedCostUsd: 1,
+      antiPatterns: [{ type: 'blind_editing', target: 'auth.ts', count: 7 }],
+    };
+    const todaySession = {
+      sessionId: 'today-session',
+      startTime: todayStart + 60 * 60 * 1000,
+      durationMs: 10 * 60 * 1000,
+      toolCallCount: 5,
+      estimatedCostUsd: 0.5,
+      antiPatterns: [{ type: 'stuck_loop', target: 'npm test', count: 3 }],
+    };
+
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/sessions?limit=')) {
+        return new Response(JSON.stringify([oldSession, todaySession]), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    renderToday();
+
+    expect(await screen.findByText('Stuck loop ×3')).toBeInTheDocument();
+    expect(screen.queryByText(/Blind editing/)).toBeNull();
+  });
+});
+
+describe("Today view — Where today's spend went panel", () => {
+  const SAMPLE_USAGE_INSIGHTS = {
+    windowDays: 1,
+    sessionCount: 3,
+    totalCostUsd: 10,
+    totalTokens: 50000,
+    insights: [
+      {
+        id: 'high_context',
+        key: 'high_context',
+        costUsd: 6,
+        tokens: 30000,
+        count: 2,
+        sharePct: 60,
+        sessionCount: 3,
+        headline: 'High-context sessions are driving spend',
+        advice: 'Trim context before starting new sessions.',
+      },
+    ],
+    skills: [{ key: 'code-review', costUsd: 3, tokens: 6000, count: 4, sharePct: 30 }],
+    subagents: [{ key: 'general-purpose', costUsd: 2, tokens: 4000, count: 3, sharePct: 20 }],
+    plugins: [{ key: 'pstack', costUsd: 1, tokens: 2000, count: 2, sharePct: 10 }],
+    loops: [],
+    skillsTotalCount: 1,
+    subagentsTotalCount: 1,
+    pluginsTotalCount: 1,
+    loopsTotalCount: 0,
+    attributionRatePct: 80,
+  };
+
+  beforeEach(() => {
+    useLiveStore.setState({
+      connected: true,
+      recentToolCalls: [],
+      cost: { sessionTotalUsd: 1, todayTotalUsd: 1, forecastEodUsd: null },
+      antiPatterns: [],
+      firingAlerts: new Map(),
+      dismissedAlerts: new Set(),
+    });
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(null), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    ) as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders the consolidated title exactly once, with the old contributing title gone', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    renderToday(qc);
+    expect(await screen.findAllByText("Where today's spend went")).toHaveLength(1);
+    expect(screen.queryByText("What's contributing to today's spend")).toBeNull();
+    expect(screen.getAllByText('Since midnight').length).toBeGreaterThan(0);
+  });
+
+  it('proves the Skills-shown-twice bug is gone: exactly one Skills table renders', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    renderToday(qc);
+    await screen.findByText('code-review');
+    expect(screen.getAllByRole('columnheader', { name: 'Skill' })).toHaveLength(1);
+    expect(screen.getAllByText('code-review')).toHaveLength(1);
+  });
+
+  it('renders a Models table row with requests, cost per million tokens, cost, and share', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    qc.setQueryData(qk.modelUsage, {
+      byModel: {
+        'claude-sonnet-5': { requestCount: 8, totalCostUsd: 4.2, costPerMillionTokens: 0.75 },
+      },
+      mostUsedModel: 'claude-sonnet-5',
+    });
+    renderToday(qc);
+    await screen.findByText("Where today's spend went");
+    const row = screen.getByText('claude-sonnet-5').closest('tr') as HTMLElement;
+    expect(within(row).getByText('8')).toBeInTheDocument();
+    expect(within(row).getByText('$0.75')).toBeInTheDocument();
+    expect(within(row).getByText('$4.20')).toBeInTheDocument();
+    expect(within(row).getByText('100%')).toBeInTheDocument();
+  });
+
+  it("renders a Tools row with a Cost column, built from today's session list plus windowed cost data", async () => {
+    const now = Date.now();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    qc.setQueryData(qk.costPerTool(), {
+      costByToolType: { Read: { totalCost: 3, callCount: 8, avgCost: 0.375, tokens: 1000 } },
+      totalAttributedCost: 3,
+      attributionRate: 1,
+    });
+    qc.setQueryData(qk.sessionsList(200), [
+      {
+        sessionId: 's1',
+        startTime: now - 1_800_000,
+        durationMs: 1_800_000,
+        toolBreakdown: { Read: 6, Edit: 2 },
+      },
+      {
+        sessionId: 's2',
+        startTime: now - 600_000,
+        durationMs: 600_000,
+        toolBreakdown: { Read: 2 },
+      },
+    ]);
+    renderToday(qc);
+    await screen.findByText("Where today's spend went");
+    const row = screen.getByRole('cell', { name: 'Read' }).closest('tr') as HTMLElement;
+    expect(within(row).getByRole('cell', { name: '8' })).toBeInTheDocument();
+    expect(within(row).getByRole('cell', { name: '$3.00' })).toBeInTheDocument();
+  });
+
+  it('shows attribution caveat when cost attribution is low', async () => {
+    const now = Date.now();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    qc.setQueryData(qk.costPerTool(), {
+      costByToolType: { Read: { totalCost: 3, callCount: 8, avgCost: 0.375, tokens: 1000 } },
+      totalAttributedCost: 3,
+      attributionRate: 0.4,
+    });
+    qc.setQueryData(qk.sessionsList(200), [
+      {
+        sessionId: 's1',
+        startTime: now - 1_800_000,
+        durationMs: 1_800_000,
+        toolBreakdown: { Read: 6, Edit: 2 },
+      },
+    ]);
+    renderToday(qc);
+    await screen.findByText("Where today's spend went");
+    expect(
+      screen.getByText(/Tool and skill shares are based on 40% of session cost/),
+    ).toBeInTheDocument();
+  });
+
+  it("excludes sessions outside today's window from the Tools table", async () => {
+    const dayStart = localStartOfDay();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    qc.setQueryData(qk.sessionsList(200), [
+      {
+        sessionId: 's1',
+        startTime: dayStart - 3 * 24 * 60 * 60 * 1000,
+        durationMs: 1_800_000,
+        toolBreakdown: { Read: 100, Edit: 50 },
+      },
+      {
+        sessionId: 's2',
+        startTime: Date.now() - 600_000,
+        durationMs: 600_000,
+        toolBreakdown: { Read: 2 },
+      },
+    ]);
+    renderToday(qc);
+    await screen.findByText('code-review');
+    const row = screen.getByRole('cell', { name: 'Read' }).closest('tr') as HTMLElement;
+    expect(within(row).getByRole('cell', { name: '2' })).toBeInTheDocument();
+  });
+
+  it('shows a Cost column on the Skills and Subagents tables', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    renderToday(qc);
+    const skillRow = (await screen.findByText('code-review')).closest('tr') as HTMLElement;
+    expect(within(skillRow).getByText('$3.00')).toBeInTheDocument();
+    const subagentRow = screen.getByText('general-purpose').closest('tr') as HTMLElement;
+    expect(within(subagentRow).getByText('$2.00')).toBeInTheDocument();
+  });
+
+  it('shows Calls and Tokens columns on the Plugins table', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), SAMPLE_USAGE_INSIGHTS);
+    renderToday(qc);
+    const pluginRow = (await screen.findByText('pstack')).closest('tr') as HTMLElement;
+    expect(within(pluginRow).getByText('2')).toBeInTheDocument();
+    expect(within(pluginRow).getByText('2.0k')).toBeInTheDocument();
+  });
+
+  it('shows "No sessions in this window." when sessionCount is 0', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    qc.setQueryData(qk.usageInsights('today'), { ...SAMPLE_USAGE_INSIGHTS, sessionCount: 0 });
+    renderToday(qc);
+    expect(await screen.findByText('No sessions in this window.')).toBeInTheDocument();
+  });
+
+  it('shows the unavailable empty state when the usage-insights query errors', async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.startsWith('/api/usage-insights')) {
+        return new Response('Service Unavailable', { status: 503 });
+      }
+      return new Response(JSON.stringify(null), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    renderToday();
+    expect(await screen.findByText('Usage insights unavailable')).toBeInTheDocument();
+  });
 });
 
 describe('Today view — Compute Waste panel', () => {
@@ -1722,7 +2026,7 @@ describe('Today view — cross-midnight session proration', () => {
     vi.restoreAllMocks();
   });
 
-  it("prorates a cross-midnight session's tool-call/flag counts and hourly spend by its today-portion, instead of its full lifetime count or excluding it entirely", async () => {
+  it("prorates a cross-midnight session's flag counts and hourly spend by its today-portion, instead of its full lifetime count or excluding it entirely", async () => {
     const dayStart = localStartOfDay();
     // Started 2h before local midnight and ran 4h total (ends 2h into
     // today) — half the session's lifetime overlaps today, ratio 0.5.
@@ -1747,7 +2051,7 @@ describe('Today view — cross-midnight session proration', () => {
             totalCostUsd: 0,
             antiPatternCount: 0,
             avgDurationMs: 0,
-            sessionCount: 0,
+            sessionCount: 1,
             sparkline: { startTimestamp: 0, bucketSizeMs: 60_000, points: [] },
             forecastEndOfDayUsd: 5,
           }),
@@ -1768,13 +2072,10 @@ describe('Today view — cross-midnight session proration', () => {
 
     renderToday();
 
-    // 100 tool calls * 0.5 ratio = 50 — not the full lifetime count of 100.
-    // Using ratio only as an inclusion gate and adding the entire
-    // toolCallCount once the session qualifies would show 100 instead.
-    expect(await screen.findByText('50')).toBeInTheDocument();
-    // 10 flags * 0.5 ratio = 5 — not the full lifetime count of 10, for the
-    // same reason.
-    expect(screen.getByText('5')).toBeInTheDocument();
+    // 10 flags * 0.5 ratio = 5 — not the full lifetime count of 10, for
+    // the same reason. This verifies the pro-rating logic works for
+    // cross-midnight sessions in the persisted data path.
+    expect(await screen.findByText('5')).toBeInTheDocument();
     // buildHourlySpend must not skip a session that didn't *start* today
     // entirely (a naive `!isToday(s.startTime)` → continue would drop it),
     // or the spend chart would render its empty state here even though
@@ -2005,164 +2306,6 @@ describe('Today view — forecast end-of-week and session chips', () => {
     await waitFor(() =>
       expect(screen.getByText(/On pace for ~\$[\d.]+ this week/)).toBeInTheDocument(),
     );
-  });
-});
-
-describe('Today view — Spend breakdown panel', () => {
-  beforeEach(() => {
-    useLiveStore.setState({
-      connected: true,
-      recentToolCalls: [],
-      cost: { sessionTotalUsd: 0, todayTotalUsd: 0, forecastEodUsd: null },
-      antiPatterns: [],
-      firingAlerts: new Map(),
-      dismissedAlerts: new Set(),
-    });
-    globalThis.fetch = vi.fn(
-      async () =>
-        new Response(JSON.stringify(null), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-    ) as typeof fetch;
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('renders the panel title', async () => {
-    renderToday();
-    expect(await screen.findByText("Where today's spend went")).toBeInTheDocument();
-  });
-
-  it('renders a model table row with requests, cost per million tokens, cost, and share', async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
-    qc.setQueryData(qk.modelUsage, {
-      byModel: {
-        'claude-sonnet-5': { requestCount: 8, totalCostUsd: 4.2, costPerMillionTokens: 0.75 },
-      },
-      mostUsedModel: 'claude-sonnet-5',
-    });
-    renderToday(qc);
-    await screen.findByText("Where today's spend went");
-    const row = screen.getByText('claude-sonnet-5').closest('tr');
-    expect(row).not.toBeNull();
-    expect(within(row as HTMLElement).getByText('8')).toBeInTheDocument();
-    expect(within(row as HTMLElement).getByText('$0.75')).toBeInTheDocument();
-    expect(within(row as HTMLElement).getByText('$4.20')).toBeInTheDocument();
-    expect(within(row as HTMLElement).getByText('100%')).toBeInTheDocument();
-  });
-
-  it('renders a tool row via ShareTable with calls, cost, and share', async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
-    qc.setQueryData(qk.costPerTool, {
-      costByToolType: { Bash: { totalCost: 3, callCount: 2, avgCost: 1.5 } },
-      totalAttributedCost: 3,
-      attributionRate: 1,
-    });
-    renderToday(qc);
-    await screen.findByText("Where today's spend went");
-    const row = screen.getByText('Bash').closest('tr') as HTMLElement;
-    expect(within(row).getByText('2')).toBeInTheDocument();
-    expect(within(row).getByText('$3.00')).toBeInTheDocument();
-    expect(within(row).getByText('100%')).toBeInTheDocument();
-  });
-
-  it('shows a skill row with its cost and share', async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
-    qc.setQueryData(qk.costPerTool, {
-      costByToolType: {},
-      costBySkill: {
-        'skill-a': { callCount: 5, attributedCallCount: 5, totalCost: 6, avgCost: 1.2 },
-        'skill-b': { callCount: 3, attributedCallCount: 3, totalCost: 4, avgCost: 1.33 },
-      },
-      totalAttributedCost: 10,
-      attributionRate: 1,
-    });
-    renderToday(qc);
-    const row = (await screen.findByText('skill-a')).closest('tr') as HTMLElement;
-    expect(within(row).getByText('$6.00')).toBeInTheDocument();
-    expect(within(row).getByText('60%')).toBeInTheDocument();
-  });
-
-  it('sorts the Tools table by a column and reverses on a second click', async () => {
-    // A nonzero todayTotalUsd keeps `noActivityToday` false for the whole
-    // test — otherwise the other today-scoped queries in this describe
-    // block's zero-spend fixture settle mid-test and flip Today from the
-    // KPI branch to the empty-state branch, remounting SpendBreakdownPanel
-    // (and losing the ShareTable's just-applied sort) between the clicks.
-    useLiveStore.setState({ cost: { sessionTotalUsd: 1, todayTotalUsd: 1, forecastEodUsd: null } });
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0, staleTime: Infinity } } });
-    qc.setQueryData(qk.costPerTool, {
-      costByToolType: {
-        Bash: { totalCost: 1, callCount: 9, avgCost: 1 },
-        Read: { totalCost: 5, callCount: 2, avgCost: 2.5 },
-      },
-      totalAttributedCost: 6,
-      attributionRate: 1,
-    });
-    renderToday(qc);
-    await screen.findByText("Where today's spend went");
-
-    const table = (await screen.findByText('Tools')).closest('div') as HTMLElement;
-    const firstToolCell = () => within(table).getAllByRole('row')[1]!.querySelector('td');
-
-    // Default sort is Share desc, so the higher-cost tool (Read) leads.
-    expect(firstToolCell()!.textContent).toBe('Read');
-
-    fireEvent.click(within(table).getByRole('button', { name: 'Calls' }));
-    expect(firstToolCell()!.textContent).toBe('Bash');
-
-    fireEvent.click(within(table).getByRole('button', { name: 'Calls' }));
-    expect(firstToolCell()!.textContent).toBe('Read');
-  });
-
-  it('renders Cost attribution unavailable when /api/cost-per-tool returns 503', async () => {
-    globalThis.fetch = vi.fn(async (url: string) => {
-      if (typeof url === 'string' && url.includes('/api/cost-per-tool')) {
-        return new Response('Service Unavailable', { status: 503 });
-      }
-      return new Response(JSON.stringify(null), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }) as typeof fetch;
-    renderToday();
-    // EmptyState's inline variant concatenates title and subtitle into one
-    // text node ("Cost attribution unavailable · Start a Claude Code...").
-    await waitFor(() =>
-      expect(screen.getByText(/Cost attribution unavailable/)).toBeInTheDocument(),
-    );
-  });
-
-  it('renders empty states across all three columns instead of crashing when the query settles with a null value', async () => {
-    // A 200 response whose body is the JSON literal `null` (distinct from a
-    // request that errors) resolves the query successfully with `data` set
-    // to `null`, not `undefined` — seed the cache directly with the
-    // already-settled value instead of waiting on the mocked fetch.
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
-    qc.setQueryData(qk.costPerTool, null);
-    renderToday(qc);
-    expect(await screen.findByText("Where today's spend went")).toBeInTheDocument();
-    expect(screen.getByText('No model data yet')).toBeInTheDocument();
-    expect(screen.getByText('No tool data yet')).toBeInTheDocument();
-    expect(screen.getByText('No skill data yet')).toBeInTheDocument();
-  });
-
-  it('shows the low-attribution footnote when attributionRate is below 50%', async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
-    qc.setQueryData(qk.costPerTool, {
-      costByToolType: {
-        Agent: { totalCost: 4.2, callCount: 8, avgCost: 0.525 },
-      },
-      totalAttributedCost: 4.2,
-      attributionRate: 0.3,
-    });
-    renderToday(qc);
-    expect(
-      await screen.findByText('Tool and skill shares are based on 30% of session cost'),
-    ).toBeInTheDocument();
   });
 });
 
@@ -2472,72 +2615,5 @@ describe('buildSpendTodaySeries()', () => {
     const nowMs = new Date(2026, 5, 14, 10, 30).getTime();
     const series = buildSpendTodaySeries(hourlySpendFixture({ 8: 2, 9: 1, 10: 3 }), 6, nowMs);
     expect(series.every((d) => d.projectedUsd === null)).toBe(true);
-  });
-});
-
-describe('buildWeekForecast()', () => {
-  // Fixed local calendar dates (not Date.now()) so the test is deterministic
-  // regardless of which day it actually runs on.
-  function nextWeekday(base: Date, targetDay: number): Date {
-    const d = new Date(base);
-    while (d.getDay() !== targetDay) d.setDate(d.getDate() + 1);
-    d.setHours(12, 0, 0, 0);
-    return d;
-  }
-
-  function makeSession(startTime: number, estimatedCostUsd: number): SessionSummary {
-    return { sessionId: `s-${startTime}`, startTime, estimatedCostUsd };
-  }
-
-  it('sums week-to-date (Monday through yesterday) and projects the remaining days from the average daily pace', () => {
-    const wednesday = nextWeekday(new Date(2026, 0, 1), 3); // Wednesday
-    const todayStart = localStartOfDay(wednesday.getTime());
-    const monday = todayStart - 2 * 86_400_000;
-    const sessions = [
-      makeSession(monday + 60_000, 10),
-      makeSession(monday + 86_400_000 + 60_000, 10), // Tuesday
-    ];
-
-    // weekToDateExcludingToday = 20, effectiveEod = max(15, 12) = 15.
-    // daysElapsedIncludingToday = 3 (Mon/Tue/Wed), remainingFullDays = 4 (Thu-Sun).
-    // avgDailySpend = (20 + 15) / 3 = 11.666...; endOfWeek = 20 + 15 + 11.666...*4.
-    const result = buildWeekForecast(sessions, 15, 12, wednesday.getTime());
-    expect(result).toBeCloseTo(20 + 15 + ((20 + 15) / 3) * 4, 5);
-  });
-
-  it('projects zero remaining days on a Sunday, so end of week is exactly week-to-date plus the end-of-day forecast', () => {
-    const sunday = nextWeekday(new Date(2026, 0, 1), 0);
-    const todayStart = localStartOfDay(sunday.getTime());
-    const monday = todayStart - 6 * 86_400_000;
-    const sessions = [
-      makeSession(monday + 60_000, 10), // Monday
-      makeSession(monday + 86_400_000 + 60_000, 5), // Tuesday
-    ];
-
-    const result = buildWeekForecast(sessions, 8, 8, sunday.getTime());
-    expect(result).toBe(15 + 8);
-  });
-
-  it('never returns less than the end-of-day forecast', () => {
-    const wednesday = nextWeekday(new Date(2026, 0, 1), 3);
-    // No week-to-date sessions and a forecast below todayTotal — the
-    // effective floor (todayTotal) must still be respected.
-    const result = buildWeekForecast([], 5, 20, wednesday.getTime());
-    expect(result).toBeGreaterThanOrEqual(20);
-  });
-
-  it('excludes sessions from a previous week', () => {
-    const wednesday = nextWeekday(new Date(2026, 0, 1), 3);
-    const todayStart = localStartOfDay(wednesday.getTime());
-    const monday = todayStart - 2 * 86_400_000;
-    const thisWeekOnly = [makeSession(monday + 60_000, 10)];
-    const withLastWeek = [
-      ...thisWeekOnly,
-      makeSession(monday - 7 * 86_400_000 + 60_000, 1000), // last week's Monday
-    ];
-
-    const baseline = buildWeekForecast(thisWeekOnly, 15, 12, wednesday.getTime());
-    const withStale = buildWeekForecast(withLastWeek, 15, 12, wednesday.getTime());
-    expect(withStale).toBe(baseline);
   });
 });

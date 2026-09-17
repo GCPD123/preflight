@@ -20,6 +20,7 @@ import type { MetricAggregator } from '../shared/index.js';
 import type { AiCodingTask } from './task-detector.js';
 import type { AntiPattern } from './anti-patterns.js';
 import type { Resettable } from './tracker-contracts.js';
+import type { CostTracker } from './cost-tracker.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,6 +46,15 @@ export interface EfficiencyScoreOptions {
   readonly autonomyWeight?: number;
   readonly firstAttemptQualityWeight?: number;
   readonly speedBaselineLinesPerSecond?: number;
+  /**
+   * When provided, `emitMetrics()` reads this tracker's current model
+   * (`CostTracker.getMetrics().model`) and attaches it as a `model` attr on
+   * every `ai.efficiency.*` gauge, matching `CostTracker.emitMetrics()`'s own
+   * `ai.cost.*` attribution. No delta computation is involved (unlike
+   * `TaskDetectorOptions.costTracker`), so there's no reset-ordering hazard —
+   * a stale or null model just means the gauge is emitted without the attr.
+   */
+  readonly costTracker?: CostTracker;
 }
 
 /**
@@ -103,6 +113,7 @@ export class EfficiencyScorer implements Resettable {
   private readonly autonomyWeight: number;
   private readonly firstAttemptQualityWeight: number;
   private readonly speedBaselineLps: number;
+  private readonly costTracker: CostTracker | null;
 
   private readonly scores: EfficiencyScore[] = [];
   private lastEmittedIndex = 0;
@@ -126,6 +137,7 @@ export class EfficiencyScorer implements Resettable {
     this.firstAttemptQualityWeight =
       options?.firstAttemptQualityWeight ?? DEFAULT_FIRST_ATTEMPT_QUALITY_WEIGHT;
     this.speedBaselineLps = options?.speedBaselineLinesPerSecond ?? DEFAULT_SPEED_BASELINE_LPS;
+    this.costTracker = options?.costTracker ?? null;
   }
 
   /**
@@ -254,13 +266,23 @@ export class EfficiencyScorer implements Resettable {
   }
 
   emitMetrics(aggregator: MetricAggregator): void {
+    const attrs: Record<string, string | number> = {};
+    const model = this.costTracker?.getMetrics().model;
+    if (model) {
+      attrs.model = model;
+    }
+
     for (let i = this.lastEmittedIndex; i < this.scores.length; i++) {
       const s = this.scores[i]!;
-      aggregator.record('ai.efficiency.score', s.score);
-      aggregator.record('ai.efficiency.speed', s.components.speed);
-      aggregator.record('ai.efficiency.correctness', s.components.correctness);
-      aggregator.record('ai.efficiency.autonomy', s.components.autonomy);
-      aggregator.record('ai.efficiency.first_attempt_quality', s.components.firstAttemptQuality);
+      aggregator.record('ai.efficiency.score', s.score, attrs);
+      aggregator.record('ai.efficiency.speed', s.components.speed, attrs);
+      aggregator.record('ai.efficiency.correctness', s.components.correctness, attrs);
+      aggregator.record('ai.efficiency.autonomy', s.components.autonomy, attrs);
+      aggregator.record(
+        'ai.efficiency.first_attempt_quality',
+        s.components.firstAttemptQuality,
+        attrs,
+      );
     }
     this.lastEmittedIndex = this.scores.length;
   }

@@ -984,6 +984,26 @@ describe('NrIngestManager', () => {
       expect(metricNames).toContain('ai.cost.tokens_input');
     });
 
+    it('derives a provider attr from the model attr on ai.cost.* gauges', async () => {
+      const sessionTracker = new SessionTracker('cost-provider-session');
+      const costTracker = new CostTracker(sessionTracker);
+      costTracker.recordTokenUsage(makeUsage(), 'claude-sonnet-5');
+
+      const manager = new NrIngestManager(makeIngestOptions({ sessionTracker, costTracker }));
+
+      manager.start();
+      await manager.stop();
+
+      const sentMetrics = (mockSendMetrics.mock.calls[0] as unknown[])[0] as Array<{
+        name: string;
+        attributes?: Record<string, unknown>;
+      }>;
+      const costMetric = sentMetrics.find((m) => m.name === 'ai.cost.session_total_usd');
+
+      expect(costMetric?.attributes?.model).toBe('claude-sonnet-5');
+      expect(costMetric?.attributes?.provider).toBe('anthropic');
+    });
+
     it('suppresses ai.cost.* gauges when companionMode is true', async () => {
       const sessionTracker = new SessionTracker('companion-gauge-session');
       const costTracker = new CostTracker(sessionTracker);

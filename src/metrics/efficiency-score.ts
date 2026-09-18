@@ -38,6 +38,15 @@ export interface EfficiencyScore {
   readonly components: EfficiencyScoreComponents;
   readonly taskId: string;
   readonly timestamp: number;
+  /**
+   * The model current on `costTracker` at the moment this score was
+   * computed, not at emit time — a task's score must keep the model that
+   * produced it even if a later token report (e.g. a subagent on a
+   * different model) changes `costTracker`'s current model before the next
+   * `emitMetrics()` call. `null` when no `costTracker` was supplied or it
+   * had no current model yet.
+   */
+  readonly model: string | null;
 }
 
 export interface EfficiencyScoreOptions {
@@ -47,12 +56,17 @@ export interface EfficiencyScoreOptions {
   readonly firstAttemptQualityWeight?: number;
   readonly speedBaselineLinesPerSecond?: number;
   /**
-   * When provided, `emitMetrics()` reads this tracker's current model
-   * (`CostTracker.getMetrics().model`) and attaches it as a `model` attr on
-   * every `ai.efficiency.*` gauge, matching `CostTracker.emitMetrics()`'s own
-   * `ai.cost.*` attribution. No delta computation is involved (unlike
-   * `TaskDetectorOptions.costTracker`), so there's no reset-ordering hazard —
-   * a stale or null model just means the gauge is emitted without the attr.
+   * When provided, `computeScore()`/`updateScore()` read this tracker's
+   * current model (`CostTracker.getMetrics().model`) at score-compute time
+   * and store it on the resulting `EfficiencyScore`, which `emitMetrics()`
+   * later attaches as a `model` attr on that score's `ai.efficiency.*`
+   * gauges — matching `CostTracker.emitMetrics()`'s own `ai.cost.*`
+   * attribution, but captured per task rather than re-read at emit time, so
+   * a subagent's token report on a different model between compute and
+   * emit can't relabel an already-scored task. No delta computation is
+   * involved (unlike `TaskDetectorOptions.costTracker`), so there's no
+   * reset-ordering hazard — a null model just means that score's gauges are
+   * emitted without the attr.
    */
   readonly costTracker?: CostTracker;
 }
@@ -153,6 +167,7 @@ export class EfficiencyScorer implements Resettable {
       components,
       taskId: task.taskId,
       timestamp: task.endTime,
+      model: this.costTracker?.getMetrics().model ?? null,
     };
 
     const idx = this.scores.findIndex((s) => s.taskId === task.taskId);
@@ -218,6 +233,8 @@ export class EfficiencyScorer implements Resettable {
       },
       taskId: 'session-average',
       timestamp: Date.now(),
+      // An average across tasks has no single model of its own.
+      model: null,
     };
   }
 
@@ -245,6 +262,7 @@ export class EfficiencyScorer implements Resettable {
       components,
       taskId: task.taskId,
       timestamp: task.endTime,
+      model: this.costTracker?.getMetrics().model ?? null,
     };
 
     if (idx >= 0) {
@@ -266,14 +284,12 @@ export class EfficiencyScorer implements Resettable {
   }
 
   emitMetrics(aggregator: MetricAggregator): void {
-    const attrs: Record<string, string | number> = {};
-    const model = this.costTracker?.getMetrics().model;
-    if (model) {
-      attrs.model = model;
-    }
-
     for (let i = this.lastEmittedIndex; i < this.scores.length; i++) {
       const s = this.scores[i]!;
+      const attrs: Record<string, string | number> = {};
+      if (s.model) {
+        attrs.model = s.model;
+      }
       aggregator.record('ai.efficiency.score', s.score, attrs);
       aggregator.record('ai.efficiency.speed', s.components.speed, attrs);
       aggregator.record('ai.efficiency.correctness', s.components.correctness, attrs);

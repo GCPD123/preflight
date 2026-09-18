@@ -1,7 +1,10 @@
 /**
  * Classifies a model ID string into the `AiProvider` it was served by, so
  * `ai.*` gauge metrics can be faceted by provider without a join against the
- * corresponding NR event (see nr-ingest.ts's `emitSessionGauges()`).
+ * corresponding NR event. Called once, from the single aggregator callback
+ * in `nr-ingest.ts`'s `emitSessionGauges()` that already wraps every
+ * gauge-emitting tracker, rather than threaded through each tracker that has
+ * a `model` dimension.
  *
  * Two distinct naming shapes exist in this codebase's own pricing table
  * (`src/shared/pricing-data.ts`, vendored — read there, don't edit here):
@@ -30,8 +33,12 @@ export function classifyProvider(model: string): AiProvider | undefined {
   if (lower.startsWith('claude')) return 'anthropic';
   if (lower.startsWith('gemini')) return 'google';
   if (lower.startsWith('gpt-') || /^o[134](-|$)/.test(lower)) return 'openai';
+  // `mistral`/`mixtral` are checked anywhere in the ID, not just as a
+  // prefix, to catch the pricing table's `open-mistral-7b` and
+  // `open-mixtral-8x7b` alongside the vendor's own `mistral-*` IDs.
   if (
-    lower.startsWith('mistral') ||
+    lower.includes('mistral') ||
+    lower.includes('mixtral') ||
     lower.startsWith('ministral') ||
     lower.startsWith('codestral')
   ) {
@@ -39,5 +46,8 @@ export function classifyProvider(model: string): AiProvider | undefined {
   }
   if (lower.startsWith('command')) return 'cohere';
 
+  // The pricing table also carries grok-*, kimi-*, mai-code-*, and
+  // raptor-mini, none of which have an AiProvider value — undefined here is
+  // intentional, not a gap.
   return undefined;
 }

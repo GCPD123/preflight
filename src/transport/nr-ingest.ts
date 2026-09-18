@@ -1720,10 +1720,6 @@ export class NrIngestManager {
       const developer = this.developer;
       const scheduler = this.primaryScheduler;
       const devAggregator = new DeveloperAttributedMetricAggregator((name, value, attrs) => {
-        // Every tracker wrapped here (CostTracker, EfficiencyScorer,
-        // ApiFailureTracker) that has a model dimension attaches it as
-        // `attrs.model` — derive `provider` from that single point instead of
-        // threading provider classification through each tracker.
         const providerAttrs: Record<string, string> = {};
         const model = attrs.model;
         if (typeof model === 'string') {

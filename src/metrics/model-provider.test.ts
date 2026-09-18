@@ -15,6 +15,8 @@ describe('classifyProvider', () => {
     ['mistral-large-latest', 'mistral'],
     ['ministral-8b-latest', 'mistral'],
     ['codestral-latest', 'mistral'],
+    ['open-mistral-7b', 'mistral'],
+    ['open-mixtral-8x7b', 'mistral'],
     ['command-r-plus', 'cohere'],
     ['command-light', 'cohere'],
   ])('classifies direct-API model %s as %s', (model, expected) => {
@@ -41,5 +43,12 @@ describe('classifyProvider', () => {
   it('returns undefined for unrecognized model IDs rather than guessing', () => {
     expect(classifyProvider('some-unknown-model')).toBeUndefined();
     expect(classifyProvider('')).toBeUndefined();
+  });
+
+  it('returns undefined for pricing-table vendors with no AiProvider value', () => {
+    expect(classifyProvider('grok-4.5')).toBeUndefined();
+    expect(classifyProvider('kimi-k2.7-code')).toBeUndefined();
+    expect(classifyProvider('mai-code-1-flash')).toBeUndefined();
+    expect(classifyProvider('raptor-mini')).toBeUndefined();
   });
 });

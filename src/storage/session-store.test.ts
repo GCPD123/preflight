@@ -1539,6 +1539,58 @@ describe('buildSessionSummary', () => {
     expect(merged.subagentCostByDayUsd).toBeUndefined();
   });
 
+  it('mergeSummaries unions timeline entries from both sides instead of keeping only the longer array', () => {
+    // Simulates a Claude Code --stdio resume: the old process's on-disk
+    // timeline is longer than what the new process has accumulated so far,
+    // so a pure longest-wins merge would drop every entry the new process
+    // wrote after the resume.
+    const existing = makeSummary({
+      timeline: [
+        { timestamp: 100, toolName: 'Read', durationMs: 5, success: true },
+        { timestamp: 200, toolName: 'Edit', durationMs: 10, success: true },
+        { timestamp: 300, toolName: 'Bash', durationMs: 20, success: true },
+      ],
+    });
+    const incoming = makeSummary({
+      timeline: [{ timestamp: 400, toolName: 'Write', durationMs: 8, success: true }],
+    });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline?.map((e) => e.timestamp)).toEqual([100, 200, 300, 400]);
+  });
+
+  it('mergeSummaries de-duplicates a timeline entry present on both sides instead of doubling it', () => {
+    const shared = { timestamp: 100, toolName: 'Read', durationMs: 5, success: true };
+    const existing = makeSummary({
+      timeline: [shared, { timestamp: 200, toolName: 'Edit', durationMs: 10, success: true }],
+    });
+    const incoming = makeSummary({
+      timeline: [shared, { timestamp: 300, toolName: 'Bash', durationMs: 20, success: true }],
+    });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline?.map((e) => e.timestamp)).toEqual([100, 200, 300]);
+  });
+
+  it('mergeSummaries caps a unioned timeline at MAX_TIMELINE_ENTRIES, keeping the newest entries', () => {
+    const existingEntries = Array.from({ length: 6000 }, (_, i) => ({
+      timestamp: i,
+      toolName: 'Read',
+      durationMs: 1,
+      success: true,
+    }));
+    const incomingEntries = Array.from({ length: 6000 }, (_, i) => ({
+      timestamp: 6000 + i,
+      toolName: 'Read',
+      durationMs: 1,
+      success: true,
+    }));
+    const existing = makeSummary({ timeline: existingEntries });
+    const incoming = makeSummary({ timeline: incomingEntries });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline).toHaveLength(10_000);
+    expect(merged.timeline?.[0]?.timestamp).toBe(2000);
+    expect(merged.timeline?.[merged.timeline!.length - 1]?.timestamp).toBe(11999);
+  });
+
   it('includes active task data in the summary', () => {
     const mockSessionTracker = {
       getMetrics: () => ({
@@ -3197,7 +3249,19 @@ describe('saveSession cross-process merge', () => {
 
 describe('attribution field', () => {
   function makeTurnCostAttributor(metrics: {
-    costByToolType?: Record<string, { totalCost: number; callCount: number; avgCost: number }>;
+    costByToolType?: Record<
+      string,
+      {
+        totalCost: number;
+        callCount: number;
+        avgCost: number;
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadTokens?: number;
+        cacheCreationTokens?: number;
+        tokens?: number;
+      }
+    >;
     costBySkill?: Record<
       string,
       {
@@ -3208,7 +3272,9 @@ describe('attribution field', () => {
         inputTokens: number;
         outputTokens: number;
         cacheReadTokens: number;
+        cacheCreationTokens: number;
         totalDurationMs: number;
+        tokens: number;
       }
     >;
   }) {
@@ -3225,7 +3291,18 @@ describe('attribution field', () => {
 
   it('composes buckets.tool and buckets.skill from the turn cost attributor', () => {
     const turnCostAttributor = makeTurnCostAttributor({
-      costByToolType: { Read: { totalCost: 0.02, callCount: 4, avgCost: 0.005 } },
+      costByToolType: {
+        Read: {
+          totalCost: 0.02,
+          callCount: 4,
+          avgCost: 0.005,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokens: 0,
+        },
+      },
       costBySkill: {
         unslop: {
           callCount: 2,
@@ -3235,7 +3312,9 @@ describe('attribution field', () => {
           inputTokens: 100,
           outputTokens: 50,
           cacheReadTokens: 10,
+          cacheCreationTokens: 5,
           totalDurationMs: 4000,
+          tokens: 165,
         },
       },
     });
@@ -3246,11 +3325,25 @@ describe('attribution field', () => {
       developer: 'alice',
     });
 
+    // Tool bucket carries no token signal from this fixture, so tokens stay
+    // 0 and breakdown is omitted; skill tokens are now the four-category
+    // sum (100 + 50 + 10 + 5 = 165, up from the pre-cache-creation 160).
     expect(summary.attribution).toEqual({
       buckets: {
         tool: { Read: { costUsd: 0.02, tokens: 0, count: 4, durationMs: 0 } },
         skill: {
-          unslop: { costUsd: 0.03, tokens: 160, count: 2, durationMs: 4000 },
+          unslop: {
+            costUsd: 0.03,
+            tokens: 165,
+            count: 2,
+            durationMs: 4000,
+            breakdown: {
+              inputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 10,
+              cacheCreationTokens: 5,
+            },
+          },
         },
       },
       highContextCostUsd: 0,
@@ -3258,11 +3351,22 @@ describe('attribution field', () => {
     });
   });
 
-  it('reads subagentByAgentType/highContextCostUsd/apiDurationMs from CostMetrics when present', () => {
+  it('reads subagentByAgentType/highContextCostUsd/apiDurationMs from CostMetrics when present, carrying the subagent breakdown', () => {
     const costTracker = {
       getMetrics: () => ({
         subagentByAgentType: {
-          'general-purpose': { costUsd: 0.5, tokens: 2000, count: 3, durationMs: 0 },
+          'general-purpose': {
+            costUsd: 0.5,
+            tokens: 2000,
+            count: 3,
+            durationMs: 0,
+            breakdown: {
+              inputTokens: 1500,
+              outputTokens: 400,
+              cacheReadTokens: 80,
+              cacheCreationTokens: 20,
+            },
+          },
         },
         highContextCostUsd: 0.75,
         apiDurationMs: 12_000,
@@ -3278,7 +3382,18 @@ describe('attribution field', () => {
     expect(summary.attribution).toEqual({
       buckets: {
         subagent: {
-          'general-purpose': { costUsd: 0.5, tokens: 2000, count: 3, durationMs: 0 },
+          'general-purpose': {
+            costUsd: 0.5,
+            tokens: 2000,
+            count: 3,
+            durationMs: 0,
+            breakdown: {
+              inputTokens: 1500,
+              outputTokens: 400,
+              cacheReadTokens: 80,
+              cacheCreationTokens: 20,
+            },
+          },
         },
       },
       highContextCostUsd: 0.75,
@@ -3334,6 +3449,52 @@ describe('attribution field', () => {
       JSON.parse(JSON.stringify(legacy)) as Parameters<typeof deserializeFullSessionSummary>[0],
     );
     expect(roundTripped.attribution).toBeUndefined();
+  });
+
+  it('parses a legacy bucket with no breakdown field (pre-#692 file) without dropping the bucket', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      attribution: {
+        buckets: {
+          skill: { unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 } },
+        },
+        highContextCostUsd: 0,
+        apiDurationMs: null,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution?.buckets.skill).toEqual({
+      unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 },
+    });
+  });
+
+  it('drops a malformed breakdown but keeps the bucket', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      attribution: {
+        buckets: {
+          skill: {
+            unslop: {
+              costUsd: 0.03,
+              tokens: 165,
+              count: 2,
+              durationMs: 4000,
+              breakdown: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 'nope' },
+            },
+          },
+        },
+        highContextCostUsd: 0,
+        apiDurationMs: null,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution?.buckets.skill).toEqual({
+      unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 },
+    });
   });
 
   it('drops a malformed bucket (missing numeric field) rather than throwing', () => {
@@ -3397,6 +3558,121 @@ describe('attribution field', () => {
       },
       highContextCostUsd: 0.1,
       apiDurationMs: 3000,
+    });
+  });
+
+  it('merge takes a field-wise max on breakdown when both sides have one', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = `merge-breakdown-both-${Date.now()}`;
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.02,
+                tokens: 100,
+                count: 4,
+                durationMs: 500,
+                breakdown: {
+                  inputTokens: 80,
+                  outputTokens: 10,
+                  cacheReadTokens: 5,
+                  cacheCreationTokens: 40,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.05,
+                tokens: 40,
+                count: 6,
+                durationMs: 300,
+                breakdown: {
+                  inputTokens: 30,
+                  outputTokens: 60,
+                  cacheReadTokens: 2,
+                  cacheCreationTokens: 10,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.attribution?.buckets.skill?.unslop.breakdown).toEqual({
+      inputTokens: 80,
+      outputTokens: 60,
+      cacheReadTokens: 5,
+      cacheCreationTokens: 40,
+    });
+  });
+
+  it("merge keeps the one side's breakdown when the other side has none", () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = `merge-breakdown-one-side-${Date.now()}`;
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: { unslop: { costUsd: 0.02, tokens: 100, count: 4, durationMs: 500 } },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.05,
+                tokens: 165,
+                count: 6,
+                durationMs: 300,
+                breakdown: {
+                  inputTokens: 100,
+                  outputTokens: 50,
+                  cacheReadTokens: 10,
+                  cacheCreationTokens: 5,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.attribution?.buckets.skill?.unslop.breakdown).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadTokens: 10,
+      cacheCreationTokens: 5,
     });
   });
 });

@@ -9,6 +9,7 @@ import type { UsageInsightsReport, UsageShareRow, LoopRow } from '../api/client'
 import {
   formatPct,
   formatRelativeTime,
+  formatTokenBreakdown,
   formatTokensCompact,
   formatUsd,
   formatUsdOrDash,
@@ -100,6 +101,10 @@ function formatSharePct(row: { readonly costUsd?: number; readonly sharePct: num
   return formatPct(
     row.costUsd !== undefined && row.costUsd > 0 && row.sharePct === 0 ? 0.1 : row.sharePct,
   );
+}
+
+function breakdownTitle(row: UsageShareRow): string | undefined {
+  return row.breakdown ? formatTokenBreakdown(row.breakdown) : undefined;
 }
 
 export function UsageContributionPanel({
@@ -226,12 +231,14 @@ export function UsageContributionPanel({
                   align: 'right',
                   cell: (row) => formatTokensCompact(row.tokens),
                   sortValue: (row) => row.tokens,
+                  title: breakdownTitle,
                 },
                 {
                   header: 'Cost',
                   align: 'right',
                   cell: (row) => formatUsdOrDash(row.costUsd),
                   sortValue: (row) => row.costUsd,
+                  title: breakdownTitle,
                 },
                 {
                   header: '% of spend',
@@ -263,12 +270,14 @@ export function UsageContributionPanel({
                   align: 'right',
                   cell: (row) => formatTokensCompact(row.tokens),
                   sortValue: (row) => row.tokens,
+                  title: breakdownTitle,
                 },
                 {
                   header: 'Cost',
                   align: 'right',
                   cell: (row) => formatUsdOrDash(row.costUsd),
                   sortValue: (row) => row.costUsd,
+                  title: breakdownTitle,
                 },
                 {
                   header: '% of spend',
@@ -286,7 +295,7 @@ export function UsageContributionPanel({
               rows={plugins}
               totalCount={data.pluginsTotalCount}
               rowKey={(row) => row.key}
-              defaultSort={{ column: 3, direction: 'desc' }}
+              defaultSort={{ column: 4, direction: 'desc' }}
               columns={[
                 { header: 'Plugin', align: 'left', cell: (row) => row.key },
                 {
@@ -300,6 +309,14 @@ export function UsageContributionPanel({
                   align: 'right',
                   cell: (row) => formatTokensCompact(row.tokens),
                   sortValue: (row) => row.tokens,
+                  title: breakdownTitle,
+                },
+                {
+                  header: 'Cost',
+                  align: 'right',
+                  cell: (row) => formatUsdOrDash(row.costUsd),
+                  sortValue: (row) => row.costUsd,
+                  title: breakdownTitle,
                 },
                 {
                   header: '% of spend',
